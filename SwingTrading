@@ -1,0 +1,181 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+from ta.volatility import AverageTrueRange
+from datetime import datetime
+import time
+
+st.set_page_config(page_title="Swing Trader (Live)", layout="wide")
+st.title("📊 Real-Time Swing Trader Dashboard")
+
+tickers = [
+    "AAPL", "TSLA", "MSFT", "GOOGL", "AMZN",
+    "NVDA", "META", "AMD", "INTC", "NFLX",
+    "BABA", "SHOP", "PYPL", "SQ", "UBER",
+    "DIS", "BA", "NKE", "T", "XOM",
+    "JNJ", "PFE", "KO", "WMT", "COST"
+]
+
+@st.cache_data(ttl=300)
+def run_analysis():
+    records = []
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            data = stock.history(period="3mo", interval="1d")
+            if data.empty:
+                continue
+
+            close = data['Close']
+            high = data['High']
+            low = data['Low']
+            volume = data['Volume']
+
+            rsi = RSIIndicator(close).rsi().iloc[-1]
+            macd_diff = MACD(close).macd_diff().iloc[-1]
+            atr = AverageTrueRange(high, low, close).average_true_range().iloc[-1]
+
+            current_price = close.iloc[-1]
+            prev_price = close.iloc[-2]
+            avg_volume = volume.rolling(window=10).mean().iloc[-1]
+            vol_spike = volume.iloc[-1] > 1.5 * avg_volume
+            gap = current_price - prev_price if abs(current_price - prev_price) > atr else 0
+
+            # MA crossover detection
+            ema_9 = close.ewm(span=9).mean()
+            ema_21 = close.ewm(span=21).mean()
+            crossover = "None"
+            if ema_9.iloc[-2] < ema_21.iloc[-2] and ema_9.iloc[-1] > ema_21.iloc[-1]:
+                crossover = "Bullish Crossover"
+            elif ema_9.iloc[-2] > ema_21.iloc[-2] and ema_9.iloc[-1] < ema_21.iloc[-1]:
+                crossover = "Bearish Crossover"
+
+            # RSI + MACD combo
+            rsi_macd_combo = False
+            if 40 < rsi < 60 and macd_diff > 0:
+                rsi_macd_combo = True
+
+            # Pattern detection (same as before)
+            pattern = "None"
+            trend = "Neutral"
+            if close.iloc[-3] < close.iloc[-4] and close.iloc[-1] > close.iloc[-3]:
+                neckline = close.iloc[-2]
+                if close.iloc[-1] > neckline:
+                    pattern = "Double Bottom"
+                    trend = "Bullish"
+            elif close.iloc[-4] > close.iloc[-3] < close.iloc[-2] and close.iloc[-1] > close.iloc[-2]:
+                neckline = max(close.iloc[-4], close.iloc[-2])
+                if close.iloc[-1] > neckline:
+                    pattern = "Inverse Head & Shoulders"
+                    trend = "Bullish"
+            elif close.iloc[-5] > close.iloc[-4] > close.iloc[-3] < close.iloc[-2] < close.iloc[-1]:
+                pattern = "Falling Wedge"
+                trend = "Bullish"
+            elif close.iloc[-5] < close.iloc[-4] < close.iloc[-3] > close.iloc[-2] > close.iloc[-1]:
+                pattern = "Rising Wedge"
+                trend = "Bearish"
+            elif close.iloc[-4] < close.iloc[-3] > close.iloc[-2] and close.iloc[-1] < close.iloc[-2]:
+                pattern = "Head & Shoulders"
+                trend = "Bearish"
+
+            # Composite signal summary
+            signals = []
+            if crossover != "None": signals.append(crossover)
+            if rsi_macd_combo: signals.append("RSI+MACD Combo")
+            if vol_spike: signals.append("Volume Spike")
+            signal_label = ", ".join(signals) if signals else "None"
+
+            prob = 80 if trend == "Bullish" and "Combo" in signal_label else 60
+
+            records.append({
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Ticker": ticker,
+                "Pattern": pattern,
+                "Trend": trend,
+                "RSI": round(rsi, 2),
+                "MACD": round(macd_diff, 2),
+                "ATR": round(atr, 2),
+                "Volume": int(volume.iloc[-1]),
+                "Gap": round(gap, 2),
+                "CurrentPrice": round(current_price, 2),
+                "Price_Target_Up": round(current_price + atr * 2, 2),
+                "Price_Target_Down": round(current_price - atr * 2, 2),
+                "Probability": prob,
+                "Signals": signal_label
+            })
+
+        except Exception as e:
+            st.warning(f"Error with {ticker}: {e}")
+    return records
+
+st.caption("⏱️ Refreshes every 5 minutes (auto-cached)")
+
+results = run_analysis()
+
+if not results:
+    st.warning("No data found.")
+else:
+    df = pd.DataFrame(results)
+    df["Trend_Icon"] = df["Trend"].map({"Bullish": "🟢", "Bearish": "🔴", "Neutral": "⚪"})
+    df["Up_Prob"] = df["Probability"].astype(str) + "%"
+
+    # Sidebar filters
+    st.sidebar.header("Filters")
+    tickers = st.sidebar.multiselect(
+    "Select Tickers",
+    sorted(df["Ticker"].unique()),
+    default=sorted(df["Ticker"].unique()))
+    interval = st.sidebar.selectbox("Chart Interval", options=["1m", "5m", "15m", "1d", "1wk"], index=3)
+    tickers = st.sidebar.multiselect(
+    "Select Tickers",
+    sorted(df["Ticker"].unique()),
+    default=sorted(df["Ticker"].unique()),
+    key="ticker_filter")
+    trends = st.sidebar.multiselect("Select Trend", ["Bullish", "Bearish", "Neutral"], default=["Bullish", "Bearish"], key="trend_filter")
+
+    filtered_df = df[(df["Ticker"].isin(tickers)) & (df["Trend"].isin(trends))]
+
+    st.subheader(f"🔍 Trade Signals ({len(filtered_df)} found)")
+    for _, row in filtered_df.iterrows():
+        with st.container():
+            col1, col2, col3 = st.columns([3, 2, 2])
+            with col1:
+                st.markdown(f"**{row['Ticker']}** — {row['Pattern']} {row['Trend_Icon']}")
+                st.caption(f"RSI: {row['RSI']} | MACD: {row['MACD']} | ATR: {row['ATR']}")
+            with col2:
+                st.metric("Price Target ↑", f"${row['Price_Target_Up']}", delta=f"{row['Probability']}%")
+                st.metric("Price Target ↓", f"${row['Price_Target_Down']}")
+            with col3:
+                st.write(f"Gap: {row['Gap']} | Volume: {row['Volume']}")
+                st.write(f"Now: ${row['CurrentPrice']}")
+                st.write(f"📌 Signals: {row['Signals']}")
+
+            with st.expander("📈 Price Trend", expanded=False):
+                try:
+                # Smart period based on interval
+                    if interval == "1m":
+                        period = "1d"
+                    elif interval == "5m":
+                        period = "5d"
+                    elif interval == "15m":
+                        period = "7d"
+                    elif interval == "1d":
+                        period = "3mo"
+                    elif interval == "1wk":
+                        period = "6mo"
+                    else:
+                        period = "1mo"
+
+                    hist = yf.Ticker(row["Ticker"]).history(period=period, interval=interval)
+
+                    if not hist.empty and "Close" in hist:
+                        # Optional: Add smoothed version
+                        hist["Smooth"] = hist["Close"].rolling(window=3).mean()
+
+                        st.line_chart(hist[["Close", "Smooth"]])
+                    else:
+                        st.caption("No chart data available.")
+                except Exception as e:
+                        st.error(f"Chart error for {row['Ticker']}: {e}")           
